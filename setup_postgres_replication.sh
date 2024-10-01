@@ -10,7 +10,7 @@ fi
 
 # Function to check if required environment variables are set
 check_env_vars() {
-    required_vars=("DB_USER" "DB_PASSWORD" "REPLICATION_USER" "REPLICATION_PASSWORD" "PRIMARY_IP" "SECONDARY_IP")
+    required_vars=("DB_NAME" "DB_USER" "DB_PASSWORD" "REPLICATION_USER" "REPLICATION_PASSWORD" "PRIMARY_IP" "SECONDARY_IP")
     for var in "${required_vars[@]}"; do
         if [ -z "${!var}" ]; then
             echo "Error: $var is not set in the .env file"
@@ -19,12 +19,9 @@ check_env_vars() {
     done
 }
 
-# Step 1: Set up primary PostgreSQL server
-setup_primary() {
-    sudo apt-get update
-    sudo apt-get install -y postgresql postgresql-contrib
-    
-    # Configure PostgreSQL for replication
+# Step 1: Configure primary PostgreSQL server for replication
+configure_primary() {
+    # Create replication user
     sudo -u postgres psql -c "CREATE USER $REPLICATION_USER WITH REPLICATION ENCRYPTED PASSWORD '$REPLICATION_PASSWORD';"
     
     # Edit postgresql.conf
@@ -39,14 +36,7 @@ setup_primary() {
     sudo systemctl restart postgresql
 }
 
-# Step 2: Create and populate sample database
-create_sample_db() {
-    sudo -u postgres psql -c "CREATE DATABASE sampledb;"
-    sudo -u postgres psql -d sampledb -c "CREATE TABLE users (id SERIAL PRIMARY KEY, name VARCHAR(100), email VARCHAR(100));"
-    sudo -u postgres psql -d sampledb -c "INSERT INTO users (name, email) VALUES ('John Doe', 'john@example.com'), ('Jane Smith', 'jane@example.com');"
-}
-
-# Step 3: Set up secondary PostgreSQL server
+# Step 2: Set up secondary PostgreSQL server
 setup_secondary() {
     sudo apt-get update
     sudo apt-get install -y postgresql postgresql-contrib
@@ -64,37 +54,42 @@ setup_secondary() {
     echo "host replication $REPLICATION_USER $PRIMARY_IP/32 md5" | sudo tee -a /etc/postgresql/*/main/pg_hba.conf
 }
 
-# Step 4: Start replication
+# Step 3: Start replication
 start_replication() {
     # Perform base backup
     sudo -u postgres pg_basebackup -h $PRIMARY_IP -D /var/lib/postgresql/*/main -U $REPLICATION_USER -v -P --wal-method=stream
     
-    # Create or modify recovery.conf (for PostgreSQL 11 and earlier) or postgresql.auto.conf (for PostgreSQL 12+)
-    if [ -f /var/lib/postgresql/*/main/postgresql.auto.conf ]; then
-        # PostgreSQL 12+
-        echo "primary_conninfo = 'host=$PRIMARY_IP port=5432 user=$REPLICATION_USER password=$REPLICATION_PASSWORD'" | sudo tee -a /var/lib/postgresql/*/main/postgresql.auto.conf
-        sudo touch /var/lib/postgresql/*/main/standby.signal
-    else
-        # PostgreSQL 11 and earlier
-        echo "standby_mode = 'on'" | sudo tee /var/lib/postgresql/*/main/recovery.conf
-        echo "primary_conninfo = 'host=$PRIMARY_IP port=5432 user=$REPLICATION_USER password=$REPLICATION_PASSWORD'" | sudo tee -a /var/lib/postgresql/*/main/recovery.conf
-    fi
+    # Create or modify postgresql.auto.conf (for PostgreSQL 12+)
+    echo "primary_conninfo = 'host=$PRIMARY_IP port=5432 user=$REPLICATION_USER password=$REPLICATION_PASSWORD'" | sudo tee -a /var/lib/postgresql/*/main/postgresql.auto.conf
+    sudo touch /var/lib/postgresql/*/main/standby.signal
     
     # Start PostgreSQL on secondary
     sudo systemctl start postgresql
+}
+
+# Step 4: Initialize database structure on secondary (if needed)
+initialize_db_structure() {
+    # Check if the database already exists
+    if sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -qw $DB_NAME; then
+        echo "Database $DB_NAME already exists. Skipping initialization."
+    else
+        echo "Creating database $DB_NAME and initializing structure..."
+        sudo -u postgres createdb $DB_NAME
+        sudo -u postgres psql -d $DB_NAME -f createdb.sql
+    fi
 }
 
 # Main execution
 check_env_vars
 
 if [ "$1" = "primary" ]; then
-    setup_primary
-    create_sample_db
-    echo "Primary PostgreSQL server setup complete!"
+    configure_primary
+    echo "Primary PostgreSQL server configured for replication!"
 elif [ "$1" = "secondary" ]; then
     setup_secondary
     start_replication
-    echo "Secondary PostgreSQL server setup complete!"
+    initialize_db_structure
+    echo "Secondary PostgreSQL server setup complete and replication started!"
 else
     echo "Usage: $0 [primary|secondary]"
     exit 1
